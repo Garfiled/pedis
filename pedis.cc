@@ -5,35 +5,44 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <pthread.h>
+#include <poll.h>
+#include <sys/epoll.h>
+
 #include <string>
 #include <iostream>
 #include <vector>
 #include <map>
+#include <queue>
+
+#include "threadsafe_queue.h"
 
 #define PORT 6379
+#define MAX_EVENTS 500
+#define THREAD_NUM 1
 
-using namespace std;
-
-class ClientMgr
+class PedisMgr
 {
 public:
-    int fd;
+    threadsafe_queue<int> q;
+    std::map<std::string,std::string> _data;
 
 };
 
-void* handle(void* conn);
-int parseMsgSub(char* cmd,int start,int end);
-int handleCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd);
+void* worker(void* argv);
+void acceptConn(int socket_fd,int epoll_fd);
+
+
 int myAtoi(char* p,int end,int* val);
-int parseCmd(char* cmd_buf,int* start_p,int cmd_length,std::string& cmd_p);
+int parseSubStr(char* cmd,int start,int end);
+int parseCmdVal(char* cmd_buf,int* start_p,int cmd_length,std::string& cmd_p);
+int parseCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd);
 
 int main(int argc, char const *argv[])
 {
-    int socket_fd,client_fd;
+    int socket_fd,epoll_fd;
     struct sockaddr_in address;
     int addrlen = sizeof(address);
 
-    // Creating socket file descriptor
     if ((socket_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0)
     {
         perror("socket failed");
@@ -48,66 +57,125 @@ int main(int argc, char const *argv[])
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
-    if (listen(socket_fd, 3) < 0)
+    if (listen(socket_fd, 5) < 0)
     {
         perror("listen");
         exit(EXIT_FAILURE);
     }
 
-    while (true)
+    epoll_fd = epoll_create(MAX_EVENTS);
+    struct epoll_event event;
+    struct epoll_event eventList[MAX_EVENTS];
+    event.events = EPOLLIN|EPOLLET;
+    event.data.fd = socket_fd;
+
+    //add Event
+    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &event) < 0)
     {
-        if ((client_fd = accept(socket_fd, (struct sockaddr *)&address,(socklen_t*)&addrlen))<0)
-        {
-            perror("accept");
-            exit(EXIT_FAILURE);
-        }
-
-        ClientMgr *client = new ClientMgr();
-        client->fd = client_fd;
-
-        pthread_t pid;
-        int ret = pthread_create(&pid,NULL,handle,client);
+        perror("epoll add failed");
+        exit(EXIT_FAILURE);
+    }
+    PedisMgr* pMgr = new PedisMgr();
+    // 创建线程池
+    pthread_t pids[THREAD_NUM];
+    for (int i=0;i<THREAD_NUM;i++)
+    {
+        int ret = pthread_create(&pids[i],NULL,worker,pMgr);
         if (ret!=0)
         {
-            perror("create thread");
+            perror("create thread failed");
             exit(EXIT_FAILURE);
         }
     }
+
+
+    //epoll
+    while(1)
+    {
+        //epoll_wait
+        int ret = epoll_wait(epoll_fd, eventList, MAX_EVENTS, 3000);
+
+        if(ret < 0)
+        {
+            std::cout << "epoll error " << ret << std::endl;
+            break;
+        } else if(ret == 0)
+        {
+            continue;
+        }
+
+        //直接获取了事件数量,给出了活动的流,这里是和poll区别的关键
+        int i = 0;
+        for(i=0; i<ret; i++)
+        {
+            //错误退出
+            if ((eventList[i].events & EPOLLERR) || (eventList[i].events & EPOLLHUP) || !(eventList[i].events & EPOLLIN))
+            {
+                std::cout << "epoll event error" << std::endl;
+                close (eventList[i].data.fd);
+                continue;
+            }
+
+            if (eventList[i].data.fd == socket_fd)
+            {
+                acceptConn(socket_fd,epoll_fd);
+            }else{
+                pMgr->q.push(eventList[i].data.fd);
+            }
+        }
+    }
+
+    close(epoll_fd);
+    close(socket_fd);
+
 
     return 0;
 }
 
 
-void* handle(void* args)
+void acceptConn(int socket_fd,int epoll_fd) {
+    struct sockaddr_in address;
+    socklen_t addrlen = sizeof(struct sockaddr_in);
+    bzero(&address, addrlen);
+
+    int client_fd = accept(socket_fd, (struct sockaddr *) &address, &addrlen);
+
+    if (client_fd < 0) {
+        std::cout << "accept error " << client_fd << std::endl;
+        return;
+    }
+    //将新建立的连接添加到EPOLL的监听中
+    struct epoll_event event;
+    event.data.fd = client_fd;
+    event.events = EPOLLIN | EPOLLET;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
+}
+
+
+void* worker(void* args)
 {
-    ClientMgr *client = (ClientMgr*)args;
-    int n;
+    PedisMgr* pMgr = (PedisMgr*)args;
     char cmd_buf[1024*16]={0};
     int cmd_length=0;
     int start=0;
-    std::map<std::string,std::string> m;
-    while (true)
+    int client_fd;
+    while (1)
     {
+        pMgr->q.wait_and_pop(client_fd);
         start = 0;
-        cmd_length = 0;
-        n = read(client->fd,cmd_buf+cmd_length, sizeof(cmd_buf)-cmd_length);
-        if (n==0)
+        cmd_length = read(client_fd,cmd_buf, sizeof(cmd_buf));
+        std::cout << "read:" << cmd_buf << std::endl;
+        if (cmd_length==0)
         {
-            break;
-        }
-        printf("client:%d msg:%s\n",client->fd,cmd_buf+cmd_length);
-        cmd_length+=n;
-        if (cmd_length>= sizeof(cmd_buf))
-        {
-            std::cout << "cmd buffer full" << std::endl;
-            break;
+            close(client_fd);
+            continue;
         }
         std::vector<std::string> cmd;
-        int ret = handleCmd(cmd_buf,cmd_length,cmd);
+        int ret = parseCmd(cmd_buf,cmd_length,cmd);
         if (ret!=0)
         {
             std::cout << "handleCmd err " << ret << std::endl;
-            break;
+            continue;
         }
 
         for (int i=0;i<cmd.size();i++)
@@ -120,60 +188,58 @@ void* handle(void* args)
         {
             if (cmd[0] == "COMMAND")
             {
-                send(client->fd,"+OK\r\n",5,0);
+                send(client_fd,"+OK\r\n",5,0);
             } else if (cmd[0] == "quit" || cmd[0] == "QUIT")
             {
-                break;
+                close(client_fd);
+                std::cout << "client " << client_fd << " quit" << std::endl;
+                continue;
             } else {
                 std::cout << "unsupport cmd " << cmd[0] << std::endl;
-                send(client->fd,"-unsupport cmd\r\n",16,0);
+                send(client_fd,"-unsupport cmd\r\n",16,0);
             }
             continue;
         } else if (cmd.size()==2)
         {
             if (cmd[0]=="get")
             {
-                if (m.end()!=m.find(cmd[1]))
+                if (pMgr->_data.end()!=pMgr->_data.find(cmd[1]))
                 {
                     std::string getRet;
                     getRet.append("$");
-                    getRet.append(std::to_string(m[cmd[1]].size()));
+                    getRet.append(std::to_string(pMgr->_data[cmd[1]].size()));
                     getRet.append("\r\n");
-                    getRet.append(m[cmd[1]]);
+                    getRet.append(pMgr->_data[cmd[1]]);
                     getRet.append("\r\n");
 
-                    send(client->fd,getRet.c_str(),getRet.size(),0);
+                    send(client_fd,getRet.c_str(),getRet.size(),0);
                 } else {
-                    send(client->fd,"$-1\r\n",5,0);
+                    send(client_fd,"$-1\r\n",5,0);
                 }
             } else {
                 std::cout << "unsupport cmd:" << cmd[0] << " " << cmd[1] << std::endl;
-                send(client->fd,"-unsupport cmd\r\n",16,0);
+                send(client_fd,"-unsupport cmd\r\n",16,0);
             }
             continue;
         } else if (cmd.size()==3)
         {
             if (cmd[0]=="set")
             {
-                m[cmd[1]]=cmd[2];
-                send(client->fd,"+OK\r\n",5,0);
+                pMgr->_data[cmd[1]]=cmd[2];
+                send(client_fd,"+OK\r\n",5,0);
             } else {
                 std::cout << "unsupport cmd:" << cmd[0] << " " << cmd[1] << " " << cmd[2] << std::endl;
-                send(client->fd,"-unsupport cmd\r\n",16,0);
+                send(client_fd,"-unsupport cmd\r\n",16,0);
             }
             continue;
         } else {
             std::cout << "unsupport cmd all" << std::endl;
-            send(client->fd,"-unsupport cmd\r\n",16,0);
+            send(client_fd,"-unsupport cmd\r\n",16,0);
         }
-
-
     }
-    std::cout << client->fd << " quit" << std::endl;
-    return NULL;
 }
 
-int handleCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd)
+int parseCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd)
 {
     int start=0;
     if (cmd_buf[0]!='*')
@@ -183,7 +249,7 @@ int handleCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd)
     }
 
     start+=1;
-    int subLen = parseMsgSub(cmd_buf,start,cmd_length);
+    int subLen = parseSubStr(cmd_buf,start,cmd_length);
     int cmdCnt;
     int ret = myAtoi(cmd_buf+start,subLen,&cmdCnt);
     if (ret!=0)
@@ -202,7 +268,7 @@ int handleCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd)
     cmd.resize(cmdCnt);
     for (int i=0;i<cmdCnt;i++)
     {
-        ret = parseCmd(cmd_buf,&start,cmd_length,cmd[i]);
+        ret = parseCmdVal(cmd_buf,&start,cmd_length,cmd[i]);
         if (ret<0)
         {
             std::cout << "parseCmd err:" << ret<< std::endl;
@@ -212,7 +278,7 @@ int handleCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd)
     return 0;
 }
 
-int parseCmd(char* cmd_buf,int* start_p,int cmd_length,std::string& cmd_p)
+int parseCmdVal(char* cmd_buf,int* start_p,int cmd_length,std::string& cmd_p)
 {
     int start = *start_p;
     if (start>=cmd_length)
@@ -220,14 +286,14 @@ int parseCmd(char* cmd_buf,int* start_p,int cmd_length,std::string& cmd_p)
     if (cmd_buf[start]!='$')
         return -2;
     start += 1;
-    int len = parseMsgSub(cmd_buf,start,cmd_length);
+    int len = parseSubStr(cmd_buf,start,cmd_length);
     if (len<=0)
         return -3;
     int cmdLen;
     int ret = myAtoi(cmd_buf+start,len,&cmdLen);
     if (cmdLen<0)
     {
-       return ret*10;
+        return ret*10;
     }
     start+=len+2;
     cmd_p.append(cmd_buf+start,cmdLen);
@@ -255,7 +321,7 @@ int myAtoi(char* p,int end,int* val)
     return 0;
 }
 
-int parseMsgSub(char* cmd,int start,int end)
+int parseSubStr(char* cmd,int start,int end)
 {
     for (int i = start;i<end-1;i++)
     {
