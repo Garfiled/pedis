@@ -31,11 +31,12 @@ public:
 void* worker(void* argv);
 void acceptConn(int socket_fd,int epoll_fd);
 
-
+// 解析redis协议
 int myAtoi(char* p,int end,int* val);
 int parseSubStr(char* cmd,int start,int end);
 int parseCmdVal(char* cmd_buf,int* start_p,int cmd_length,std::string& cmd_p);
 int parseCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd);
+
 
 int main(int argc, char const *argv[])
 {
@@ -69,13 +70,14 @@ int main(int argc, char const *argv[])
     event.events = EPOLLIN|EPOLLET;
     event.data.fd = socket_fd;
 
-    //add Event
     if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &event) < 0)
     {
         perror("epoll add failed");
         exit(EXIT_FAILURE);
     }
+
     PedisMgr* pMgr = new PedisMgr();
+
     // 创建线程池
     pthread_t pids[THREAD_NUM];
     for (int i=0;i<THREAD_NUM;i++)
@@ -104,11 +106,8 @@ int main(int argc, char const *argv[])
             continue;
         }
 
-        //直接获取了事件数量,给出了活动的流,这里是和poll区别的关键
-        int i = 0;
-        for(i=0; i<ret; i++)
+        for(int i=0; i<ret; i++)
         {
-            //错误退出
             if ((eventList[i].events & EPOLLERR) || (eventList[i].events & EPOLLHUP) || !(eventList[i].events & EPOLLIN))
             {
                 std::cout << "epoll event error" << std::endl;
@@ -128,6 +127,7 @@ int main(int argc, char const *argv[])
     close(epoll_fd);
     close(socket_fd);
 
+    delete pMgr;
 
     return 0;
 }
@@ -164,7 +164,7 @@ void* worker(void* args)
         pMgr->q.wait_and_pop(client_fd);
         start = 0;
         cmd_length = read(client_fd,cmd_buf, sizeof(cmd_buf));
-        std::cout << "read:" << cmd_buf << std::endl;
+//        std::cout << "read:" << cmd_buf << std::endl;
         if (cmd_length==0)
         {
             close(client_fd);
@@ -178,12 +178,7 @@ void* worker(void* args)
             continue;
         }
 
-        for (int i=0;i<cmd.size();i++)
-        {
-            std::cout << cmd[i] << " ";
-        }
-        std::cout << std::endl;
-
+        // 执行命令
         if (cmd.size()==1)
         {
             if (cmd[0] == "COMMAND")
