@@ -180,54 +180,53 @@ int main(int argc, char const *argv[])
 
 void processQuery(Pedis* pedis,Client* client)
 {
-    Client cc = *client;
-    int n = read(cc.fd,cc.queryBuf+cc.queryLen,cc.queryCap-cc.queryLen);
+    int n = read(client->fd,client->queryBuf+client->queryLen,client->queryCap-client->queryLen);
     if (n==0)
     {
-        close(cc.fd);
-        pedis->client.erase(cc.fd);
+        close(client->fd);
+        pedis->client.erase(client->fd);
         delete client;
         return;
     }
-    cc.queryLen+=n;
+    client->queryLen+=n;
 
     // 开始解析命令，并决定命令到worker线程的路由
 
     int ret;
-    int start = cc.queryStart;
+    int start = client->queryStart;
     while (true)
     {
         std::vector<std::string>* cmd = new std::vector<std::string>;
         // 结果存至cmd，如 [set name liu] 或 [set name]
-        ret = parseCmd(cc.queryBuf,&start,cc.queryLen,cmd);
+        ret = parseCmd(client->queryBuf,&start,client->queryLen,cmd);
         if (ret==0)
         {
-            cc.queryStart = start;
+            client->queryStart = start;
 
             // 将命令发送到任务队列
-            pedis->q.push(CmdInfo(cc.fd,cmd));
+            pedis->q.push(CmdInfo(client->fd,cmd));
 
-            if (start>=cc.queryLen) {
-                cc.queryLen = 0;
-                cc.queryStart = 0;
+            if (start>=client->queryLen) {
+                client->queryLen = 0;
+                client->queryStart = 0;
                 break;
             }
         } else if (ret==ERR_CMD_NOT_COMPLETE)
         {
-            if (cc.queryLen>=cc.queryCap)
+            if (client->queryLen>=client->queryCap)
             {
-                if (cc.queryLen<CMD_LEN_LIMIT)
+                if (client->queryLen<CMD_LEN_LIMIT)
                 {
-                    char* newBuf = new char[cc.queryLen*2];
-                    memcpy(newBuf,cc.queryBuf,cc.queryLen);
-                    delete cc.queryBuf;
-                    cc.queryBuf = newBuf;
-                    cc.queryCap = cc.queryLen*2;
+                    char* newBuf = new char[client->queryLen*2];
+                    memcpy(newBuf,client->queryBuf,client->queryLen);
+                    delete client->queryBuf;
+                    client->queryBuf = newBuf;
+                    client->queryCap = client->queryLen*2;
                     break;
                 } else {
                     std::cout << "query buffer full" << std::endl;
-                    close(cc.fd);
-                    pedis->client.erase(cc.fd);
+                    close(client->fd);
+                    pedis->client.erase(client->fd);
                     return;
                 }
             } else
@@ -235,8 +234,8 @@ void processQuery(Pedis* pedis,Client* client)
                 break;
             }
         } else {
-            close(cc.fd);
-            pedis->client.erase(cc.fd);
+            close(client->fd);
+            pedis->client.erase(client->fd);
             delete client;
             return;
         }
@@ -260,7 +259,7 @@ void acceptConn(int socket_fd,int epoll_fd,Pedis* pedis)
     //将新建立的连接添加到EPOLL的监听中
     struct epoll_event event;
     event.data.fd = client_fd;
-    event.events = EPOLLIN | EPOLLET;
+    event.events = EPOLLIN;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
 
     pedis->client[client_fd] = new Client(client_fd,4096);
