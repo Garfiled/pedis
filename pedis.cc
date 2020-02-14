@@ -10,6 +10,7 @@
 
 #include <string>
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <map>
 #include <queue>
@@ -70,6 +71,10 @@ public:
     void sendOkStat(int fd);
     void sendUnSupportStat(int fd);
     void sendString(int fd,std::string&);
+
+    void handleCmdSet(int fd,std::string& key,std::string& val);
+
+    int init(std::string& path);
 };
 
 
@@ -123,6 +128,9 @@ int main(int argc, char const *argv[])
 
     Pedis* pedis = new Pedis();
 
+    std::string path("./pedis.db");
+    pedis->init(path);
+
     // 创建线程池
     pthread_t pids[THREAD_NUM];
     for (int i=0;i<THREAD_NUM;i++)
@@ -134,6 +142,7 @@ int main(int argc, char const *argv[])
             exit(EXIT_FAILURE);
         }
     }
+
 
 
     //epoll
@@ -293,6 +302,58 @@ void Pedis::sendString(int fd,std::string& str)
     ::send(fd,ret.c_str(),ret.size(),0);
 }
 
+int Pedis::init(std::string& path)
+{
+    {
+        std::ifstream infile(path);
+        if (!infile.is_open())
+        {
+            std::ofstream ofile(path);
+            ofile.close();
+        } else {
+            infile.close();
+        }
+
+    }
+
+    std::fstream db_file;
+    db_file.open("./pedis.db", std::ios::out | std::ios::in|std::ios::binary);
+
+    if (!db_file.is_open())
+    {
+        std::cout << "open db file failed" << std::endl;
+        return -1;
+    }
+
+    db_file.seekg(0,std::ios::end);
+    std::streampos size = db_file.tellg();
+
+    if (size==0)
+    {
+        db_file.seekp(0,std::ios::beg);
+        db_file.write("Pedis",5);
+        db_file.sync();
+        return 0;
+    }
+
+    db_file.seekg(0,std::ios::beg);
+    char buf[4096];
+    db_file.read(buf,sizeof(buf));
+    if (strcmp(buf,"Pedis")!=0)
+    {
+        std::cout << "file not Pedis header" << std::endl;
+        return -1;
+    }
+
+    std::cout << "open " << path << " ok" << std::endl;
+    return 0;
+}
+
+void Pedis::handleCmdSet(int fd, std::string& key,std::string& val)
+{
+
+}
+
 void* worker(void* args)
 {
     Pedis* pedis = (Pedis*)args;
@@ -334,8 +395,7 @@ void* worker(void* args)
         {
             if (cmd[0]=="set")
             {
-                pedis->_data[cmd[1]]=cmd[2];
-                pedis->sendOkStat(client_fd);
+                pedis->handleCmdSet(client_fd,cmd[1],cmd[2]);
             } else {
                 pedis->sendUnSupportStat(client_fd);
             }
