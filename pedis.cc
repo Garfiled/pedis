@@ -66,7 +66,12 @@ public:
     threadsafe_queue<CmdInfo> q;
     std::map<std::string,std::string> _data;
 
+    void send(int fd);
+    void sendOkStat(int fd);
+    void sendUnSupportStat(int fd);
+    void sendString(int fd,std::string&);
 };
+
 
 void* worker(void* argv);
 void acceptConn(int socket_fd,int epoll_fd,Pedis* pedis);
@@ -265,6 +270,28 @@ void acceptConn(int socket_fd,int epoll_fd,Pedis* pedis)
     pedis->client[client_fd] = new Client(client_fd,4096);
 }
 
+void Pedis::sendOkStat(int fd)
+{
+    ::send(fd,"+OK\r\n",5,0);
+}
+
+void Pedis::sendUnSupportStat(int fd)
+{
+    ::send(fd,"-unsupport cmd\r\n",16,0);
+}
+
+void Pedis::sendString(int fd,std::string& str)
+{
+    std::string ret;
+    ret.reserve(str.size()+5+4);
+    ret.append("$");
+    ret.append(std::to_string(str.size()));
+    ret.append("\r\n");
+    ret.append(str);
+    ret.append("\r\n");
+
+    ::send(fd,ret.c_str(),ret.size(),0);
+}
 
 void* worker(void* args)
 {
@@ -280,15 +307,13 @@ void* worker(void* args)
         {
             if (cmd[0] == "COMMAND")
             {
-                send(client_fd,"+OK\r\n",5,0);
+                pedis->sendOkStat(client_fd);
             } else if (cmd[0] == "quit" || cmd[0] == "QUIT")
             {
                 close(client_fd);
                 std::cout << "client " << client_fd << " quit" << std::endl;
-                continue;
             } else {
-                std::cout << "unsupport cmd " << cmd[0] << std::endl;
-                send(client_fd,"-unsupport cmd\r\n",16,0);
+                pedis->sendUnSupportStat(client_fd);
             }
             continue;
         } else if (cmd.size()==2)
@@ -297,20 +322,12 @@ void* worker(void* args)
             {
                 if (pedis->_data.end()!=pedis->_data.find(cmd[1]))
                 {
-                    std::string getRet;
-                    getRet.append("$");
-                    getRet.append(std::to_string(pedis->_data[cmd[1]].size()));
-                    getRet.append("\r\n");
-                    getRet.append(pedis->_data[cmd[1]]);
-                    getRet.append("\r\n");
-
-                    send(client_fd,getRet.c_str(),getRet.size(),0);
+                    pedis->sendString(client_fd,pedis->_data[cmd[1]]);
                 } else {
                     send(client_fd,"$-1\r\n",5,0);
                 }
             } else {
-                std::cout << "unsupport cmd:" << cmd[0] << " " << cmd[1] << std::endl;
-                send(client_fd,"-unsupport cmd\r\n",16,0);
+                pedis->sendUnSupportStat(client_fd);
             }
             continue;
         } else if (cmd.size()==3)
@@ -318,15 +335,13 @@ void* worker(void* args)
             if (cmd[0]=="set")
             {
                 pedis->_data[cmd[1]]=cmd[2];
-                send(client_fd,"+OK\r\n",5,0);
+                pedis->sendOkStat(client_fd);
             } else {
-                std::cout << "unsupport cmd:" << cmd[0] << " " << cmd[1] << " " << cmd[2] << std::endl;
-                send(client_fd,"-unsupport cmd\r\n",16,0);
+                pedis->sendUnSupportStat(client_fd);
             }
             continue;
         } else {
-            std::cout << "unsupport cmd all" << std::endl;
-            send(client_fd,"-unsupport cmd\r\n",16,0);
+            pedis->sendUnSupportStat(client_fd);
         }
 
         delete cmdInfo.args;
