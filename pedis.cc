@@ -19,24 +19,64 @@
 #define PORT 6379
 #define MAX_EVENTS 500
 #define THREAD_NUM 1
+#define CMD_LEN_LIMIT 500*1024*1024
 
-class PedisMgr
+#define ERR_CMD_CNT_FLAG     100001
+#define ERR_CMD_CNT_VAL      100002
+#define ERR_CMD_NOT_COMPLETE 100003
+#define ERR_CMD_SUB_LEN      100004
+#define ERR_CMD_LEN          100005
+#define ERR_CMD_VAL          100006
+
+class Client
 {
 public:
-    threadsafe_queue<int> q;
+    Client(int client_fd,int size)
+    {
+        fd = client_fd;
+        queryBuf = new char[size];
+        queryCap = size;
+        queryLen = 0;
+        queryStart = 0;
+    }
+    int fd;
+    char* queryBuf;
+    int queryStart;
+    int queryLen;
+    int queryCap;
+};
+
+class CmdInfo
+{
+public:
+    CmdInfo(int client_fd,std::vector<std::string>* cmd):fd(client_fd),args(cmd){};
+    CmdInfo()
+    {
+        fd = 0;
+        args = nullptr;
+    }
+    int fd;
+    std::vector<std::string>* args;
+};
+
+class Pedis
+{
+public:
+    std::map<int,Client*> client;
+    threadsafe_queue<CmdInfo> q;
     std::map<std::string,std::string> _data;
 
 };
 
 void* worker(void* argv);
-void acceptConn(int socket_fd,int epoll_fd);
+void acceptConn(int socket_fd,int epoll_fd,Pedis* pedis);
+void processConn(Pedis* pedis,Client* cc);
 
 // 解析redis协议
 int myAtoi(char* p,int end,int* val);
 int parseSubStr(char* cmd,int start,int end);
 int parseCmdVal(char* cmd_buf,int* start_p,int cmd_length,std::string& cmd_p);
-int parseCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd);
-
+int parseCmd(char* cmd_buf,int* start_p,int cmd_length,std::vector<std::string>* cmd);
 
 int main(int argc, char const *argv[])
 {
@@ -76,13 +116,13 @@ int main(int argc, char const *argv[])
         exit(EXIT_FAILURE);
     }
 
-    PedisMgr* pMgr = new PedisMgr();
+    Pedis* pedis = new Pedis();
 
     // 创建线程池
     pthread_t pids[THREAD_NUM];
     for (int i=0;i<THREAD_NUM;i++)
     {
-        int ret = pthread_create(&pids[i],NULL,worker,pMgr);
+        int ret = pthread_create(&pids[i],NULL,worker,pedis);
         if (ret!=0)
         {
             perror("create thread failed");
@@ -117,9 +157,15 @@ int main(int argc, char const *argv[])
 
             if (eventList[i].data.fd == socket_fd)
             {
-                acceptConn(socket_fd,epoll_fd);
+                acceptConn(socket_fd,epoll_fd,pedis);
             }else{
-                pMgr->q.push(eventList[i].data.fd);
+                if (pedis->client.end()==pedis->client.find(eventList[i].data.fd))
+                {
+                    std::cout << "client not found " << eventList[i].data.fd << std::endl;
+                    continue;
+                }
+
+                processConn(pedis,pedis->client[eventList[i].data.fd]);
             }
         }
     }
@@ -127,13 +173,74 @@ int main(int argc, char const *argv[])
     close(epoll_fd);
     close(socket_fd);
 
-    delete pMgr;
+    delete pedis;
 
     return 0;
 }
 
+void processConn(Pedis* pedis,Client* client)
+{
+    Client cc = *client;
+    int n = read(cc.fd,cc.queryBuf+cc.queryLen,cc.queryCap-cc.queryLen);
+    if (n==0)
+    {
+        close(cc.fd);
+        pedis->client.erase(cc.fd);
+        return;
+    }
+    cc.queryLen+=n;
 
-void acceptConn(int socket_fd,int epoll_fd) {
+    // 开始解析命令，并决定命令到worker线程的路由
+
+    int ret;
+    int start = cc.queryStart;
+    while (true)
+    {
+        std::vector<std::string>* cmd = new std::vector<std::string>;
+        ret = parseCmd(cc.queryBuf,&start,cc.queryLen,cmd);
+        if (ret==0)
+        {
+            cc.queryStart = start;
+            pedis->q.push(CmdInfo(cc.fd,cmd));
+            if (start>=cc.queryLen) {
+                cc.queryLen = 0;
+                cc.queryStart = 0;
+                break;
+            }
+        } else if (ret==ERR_CMD_NOT_COMPLETE)
+        {
+            if (cc.queryLen>=cc.queryCap)
+            {
+                if (cc.queryLen<CMD_LEN_LIMIT)
+                {
+                    char* newBuf = new char[cc.queryLen*2];
+                    memcpy(newBuf,cc.queryBuf,cc.queryLen);
+                    delete cc.queryBuf;
+                    cc.queryBuf = newBuf;
+                    cc.queryCap = cc.queryLen*2;
+                    break;
+                } else {
+                    std::cout << "query buffer full" << std::endl;
+                    close(cc.fd);
+                    pedis->client.erase(cc.fd);
+                    return;
+                }
+            } else
+            {
+                break;
+            }
+        } else {
+            close(cc.fd);
+            pedis->client.erase(cc.fd);
+            return;
+        }
+    }
+    return;
+}
+
+
+void acceptConn(int socket_fd,int epoll_fd,Pedis* pedis)
+{
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(struct sockaddr_in);
     bzero(&address, addrlen);
@@ -149,35 +256,20 @@ void acceptConn(int socket_fd,int epoll_fd) {
     event.data.fd = client_fd;
     event.events = EPOLLIN | EPOLLET;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
+
+    pedis->client[client_fd] = new Client(client_fd,4096);
 }
 
 
 void* worker(void* args)
 {
-    PedisMgr* pMgr = (PedisMgr*)args;
-    char cmd_buf[1024*16]={0};
-    int cmd_length=0;
-    int start=0;
-    int client_fd;
+    Pedis* pedis = (Pedis*)args;
     while (1)
     {
-        pMgr->q.wait_and_pop(client_fd);
-        start = 0;
-        cmd_length = read(client_fd,cmd_buf, sizeof(cmd_buf));
-//        std::cout << "read:" << cmd_buf << std::endl;
-        if (cmd_length==0)
-        {
-            close(client_fd);
-            continue;
-        }
-        std::vector<std::string> cmd;
-        int ret = parseCmd(cmd_buf,cmd_length,cmd);
-        if (ret!=0)
-        {
-            std::cout << "handleCmd err " << ret << std::endl;
-            continue;
-        }
-
+        CmdInfo cmdInfo;
+        pedis->q.wait_and_pop(cmdInfo);
+        std::vector<std::string> cmd = *(cmdInfo.args);
+        int client_fd = cmdInfo.fd;
         // 执行命令
         if (cmd.size()==1)
         {
@@ -198,13 +290,13 @@ void* worker(void* args)
         {
             if (cmd[0]=="get")
             {
-                if (pMgr->_data.end()!=pMgr->_data.find(cmd[1]))
+                if (pedis->_data.end()!=pedis->_data.find(cmd[1]))
                 {
                     std::string getRet;
                     getRet.append("$");
-                    getRet.append(std::to_string(pMgr->_data[cmd[1]].size()));
+                    getRet.append(std::to_string(pedis->_data[cmd[1]].size()));
                     getRet.append("\r\n");
-                    getRet.append(pMgr->_data[cmd[1]]);
+                    getRet.append(pedis->_data[cmd[1]]);
                     getRet.append("\r\n");
 
                     send(client_fd,getRet.c_str(),getRet.size(),0);
@@ -220,7 +312,7 @@ void* worker(void* args)
         {
             if (cmd[0]=="set")
             {
-                pMgr->_data[cmd[1]]=cmd[2];
+                pedis->_data[cmd[1]]=cmd[2];
                 send(client_fd,"+OK\r\n",5,0);
             } else {
                 std::cout << "unsupport cmd:" << cmd[0] << " " << cmd[1] << " " << cmd[2] << std::endl;
@@ -231,45 +323,51 @@ void* worker(void* args)
             std::cout << "unsupport cmd all" << std::endl;
             send(client_fd,"-unsupport cmd\r\n",16,0);
         }
+
+        delete cmdInfo.args;
     }
 }
 
-int parseCmd(char* cmd_buf,int cmd_length,std::vector<std::string>& cmd)
+int parseCmd(char* cmd_buf,int* start_p,int cmd_length,std::vector<std::string>* cmd)
 {
-    int start=0;
-    if (cmd_buf[0]!='*')
-    {
-        std::cout << "cmdCnt flag err " << cmd_buf[0] << std::endl;
-        return -1;
-    }
+    int start = *start_p;
+    if (cmd_buf[start]!='*')
+        return ERR_CMD_CNT_FLAG;
 
     start+=1;
+    if (start>=cmd_length)
+        return ERR_CMD_NOT_COMPLETE;
+
     int subLen = parseSubStr(cmd_buf,start,cmd_length);
+    if (subLen<0)
+    {
+        return ERR_CMD_NOT_COMPLETE;
+    } else if (subLen==0)
+    {
+        return ERR_CMD_CNT_VAL;
+    }
     int cmdCnt;
     int ret = myAtoi(cmd_buf+start,subLen,&cmdCnt);
     if (ret!=0)
-    {
-        std::cout << "cmdCnt atoi err " << ret << std::endl;
-        return ret;
-    }
+        return ERR_CMD_CNT_VAL;
 
     if (cmdCnt<=0)
-    {
-        std::cout << "cmdCnt value err:" << cmdCnt<< std::endl;
-        return -100;
-    }
+        return ERR_CMD_CNT_VAL;
 
     start+=subLen+2;
-    cmd.resize(cmdCnt);
+    if (start>=cmd_length)
+        return ERR_CMD_NOT_COMPLETE;
+
+    cmd->resize(cmdCnt);
     for (int i=0;i<cmdCnt;i++)
     {
-        ret = parseCmdVal(cmd_buf,&start,cmd_length,cmd[i]);
-        if (ret<0)
+        ret = parseCmdVal(cmd_buf,&start,cmd_length,(*cmd)[i]);
+        if (ret!=0)
         {
-            std::cout << "parseCmd err:" << ret<< std::endl;
-            return ret*1000;
+            return ret;
         }
     }
+    *start_p = start;
     return 0;
 }
 
@@ -277,20 +375,32 @@ int parseCmdVal(char* cmd_buf,int* start_p,int cmd_length,std::string& cmd_p)
 {
     int start = *start_p;
     if (start>=cmd_length)
-        return -1;
+        return ERR_CMD_NOT_COMPLETE;
     if (cmd_buf[start]!='$')
-        return -2;
+        return ERR_CMD_SUB_LEN;
     start += 1;
+    if (start>=cmd_length)
+        return ERR_CMD_NOT_COMPLETE;
     int len = parseSubStr(cmd_buf,start,cmd_length);
-    if (len<=0)
-        return -3;
+    if (len<0) {
+        return ERR_CMD_NOT_COMPLETE;
+    } else if (len==0) {
+        return ERR_CMD_SUB_LEN;
+    }
     int cmdLen;
     int ret = myAtoi(cmd_buf+start,len,&cmdLen);
-    if (cmdLen<0)
-    {
-        return ret*10;
-    }
+    if (ret!=0)
+        return ERR_CMD_SUB_LEN;
+
+    if (cmdLen<=0)
+        return ERR_CMD_SUB_LEN;
     start+=len+2;
+
+    if (cmd_length-start<cmdLen+2)
+        return ERR_CMD_NOT_COMPLETE;
+    if (cmd_buf[start+cmdLen]!='\r' || cmd_buf[start+cmdLen+1]!='\n')
+        return ERR_CMD_VAL;
+
     cmd_p.append(cmd_buf+start,cmdLen);
     start+=cmdLen+2;
     *start_p = start;
