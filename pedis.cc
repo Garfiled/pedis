@@ -70,7 +70,7 @@ public:
 
 void* worker(void* argv);
 void acceptConn(int socket_fd,int epoll_fd,Pedis* pedis);
-void processConn(Pedis* pedis,Client* cc);
+void processQuery(Pedis* pedis,Client* cc);
 
 // 解析redis协议
 int myAtoi(char* p,int end,int* val);
@@ -165,7 +165,7 @@ int main(int argc, char const *argv[])
                     continue;
                 }
 
-                processConn(pedis,pedis->client[eventList[i].data.fd]);
+                processQuery(pedis,pedis->client[eventList[i].data.fd]);
             }
         }
     }
@@ -178,7 +178,7 @@ int main(int argc, char const *argv[])
     return 0;
 }
 
-void processConn(Pedis* pedis,Client* client)
+void processQuery(Pedis* pedis,Client* client)
 {
     Client cc = *client;
     int n = read(cc.fd,cc.queryBuf+cc.queryLen,cc.queryCap-cc.queryLen);
@@ -186,6 +186,7 @@ void processConn(Pedis* pedis,Client* client)
     {
         close(cc.fd);
         pedis->client.erase(cc.fd);
+        delete client;
         return;
     }
     cc.queryLen+=n;
@@ -197,11 +198,15 @@ void processConn(Pedis* pedis,Client* client)
     while (true)
     {
         std::vector<std::string>* cmd = new std::vector<std::string>;
+        // 结果存至cmd，如 [set name liu] 或 [set name]
         ret = parseCmd(cc.queryBuf,&start,cc.queryLen,cmd);
         if (ret==0)
         {
             cc.queryStart = start;
+
+            // 将命令发送到任务队列
             pedis->q.push(CmdInfo(cc.fd,cmd));
+
             if (start>=cc.queryLen) {
                 cc.queryLen = 0;
                 cc.queryStart = 0;
@@ -232,6 +237,7 @@ void processConn(Pedis* pedis,Client* client)
         } else {
             close(cc.fd);
             pedis->client.erase(cc.fd);
+            delete client;
             return;
         }
     }
