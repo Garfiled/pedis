@@ -60,19 +60,34 @@ public:
     std::vector<std::string>* args;
 };
 
+class RecordMeta
+{
+public:
+    RecordMeta(int offset,int size):rec_offset(offset),rec_size(size){};
+    RecordMeta():rec_offset(0),rec_size(0){};
+    int rec_offset;
+    int rec_size;
+};
+
+
 class Pedis
 {
 public:
     std::map<int,Client*> client;
     threadsafe_queue<CmdInfo> q;
-    std::map<std::string,std::string> _data;
+    std::map<std::string,RecordMeta> records;
+
+    std::fstream* db_file;
+    int db_size;
 
     void send(int fd);
     void sendOkStat(int fd);
     void sendUnSupportStat(int fd);
     void sendString(int fd,std::string&);
+    void sendCharStar(int fd,char* buf,int n);
 
     void handleCmdSet(int fd,std::string& key,std::string& val);
+    void handleCmdGet(int fd,std::string&);
 
     int init(std::string& path);
 };
@@ -129,8 +144,12 @@ int main(int argc, char const *argv[])
     Pedis* pedis = new Pedis();
 
     std::string path("./pedis.db");
-    pedis->init(path);
-
+    int ret = pedis->init(path);
+    if (ret!=0)
+    {
+        std::cout << "pedis init failed " << ret << std::endl;
+        exit(EXIT_FAILURE);
+    }
     // 创建线程池
     pthread_t pids[THREAD_NUM];
     for (int i=0;i<THREAD_NUM;i++)
@@ -142,8 +161,6 @@ int main(int argc, char const *argv[])
             exit(EXIT_FAILURE);
         }
     }
-
-
 
     //epoll
     while(1)
@@ -302,8 +319,22 @@ void Pedis::sendString(int fd,std::string& str)
     ::send(fd,ret.c_str(),ret.size(),0);
 }
 
+void Pedis::sendCharStar(int fd,char* buf,int n)
+{
+    std::string ret;
+    ret.reserve(n+5+4);
+    ret.append("$");
+    ret.append(std::to_string(n));
+    ret.append("\r\n");
+    ret.append(buf,n);
+    ret.append("\r\n");
+
+    ::send(fd,ret.c_str(),ret.size(),0);
+}
+
 int Pedis::init(std::string& path)
 {
+    std::cout << "pedis init " << path << std::endl;
     {
         std::ifstream infile(path);
         if (!infile.is_open())
@@ -316,42 +347,141 @@ int Pedis::init(std::string& path)
 
     }
 
-    std::fstream db_file;
-    db_file.open("./pedis.db", std::ios::out | std::ios::in|std::ios::binary);
-
-    if (!db_file.is_open())
+    std::fstream* file = new std::fstream();
+    file->open(path, std::ios::out | std::ios::in|std::ios::binary);
+    if (!file->is_open())
     {
         std::cout << "open db file failed" << std::endl;
         return -1;
     }
-
-    db_file.seekg(0,std::ios::end);
-    std::streampos size = db_file.tellg();
-
-    if (size==0)
+    this->db_file = file;
+    this->db_file->seekg(0,std::ios::end);
+    this->db_size = this->db_file->tellg();
+    if (this->db_size==0)
     {
-        db_file.seekp(0,std::ios::beg);
-        db_file.write("Pedis",5);
-        db_file.sync();
-        return 0;
+        this->db_file->seekp(0,std::ios::beg);
+        char buf[4096];
+        memcpy(buf,"Pedis",5);
+        this->db_file->write(buf,sizeof(buf));
+        this->db_file->sync();
+        this->db_size = sizeof(buf);
     }
 
-    db_file.seekg(0,std::ios::beg);
+
+    this->db_file->seekg(0,std::ios::beg);
     char buf[4096];
-    db_file.read(buf,sizeof(buf));
-    if (strcmp(buf,"Pedis")!=0)
+    this->db_file->read(buf,sizeof(buf));
+    if (strncmp(buf,"Pedis",5)!=0)
     {
-        std::cout << "file not Pedis header" << std::endl;
+        std::cout << "file Pedis header err" << std::endl;
         return -1;
     }
 
+    int start = 4096;
+    short record_key_len = 0;
+    int record_val_size = 0;
+    int record_total = 0;
+    int record_size = 0;
+    while (start < this->db_size)
+    {
+        this->db_file->seekg(start,std::ios::beg);
+        this->db_file->read(buf,sizeof(buf));
+        // check magic number
+        if (strncmp(buf,"aa55",4) !=0)
+        {
+            std::cout << "file record magic err "<< start << std::endl;
+            return -1;
+        }
+        record_key_len = *((short*)&buf[4]);
+        if (record_key_len>2048)
+        {
+            std::cout << "file key length too long "<< record_key_len << std::endl;
+            return -1;
+        }
+
+        record_val_size = *((int*)&buf[4+2+record_key_len]);
+
+        std::string key(&buf[4+2],record_key_len);
+        record_total = 4+2+record_key_len+4+record_val_size;
+        if (record_total%4096>0)
+        {
+            record_size = (record_total/4096+1)*4096;
+        } else
+        {
+            record_size = record_total;
+        }
+        if (start+record_size<=this->db_size)
+        {
+            RecordMeta recordMeta(start,record_size);
+            this->records[key] =recordMeta;
+        } else {
+            std::cout << "file record length err " << std::endl;
+            return -1;
+        }
+        start += record_size;
+    }
     std::cout << "open " << path << " ok" << std::endl;
+
     return 0;
 }
 
-void Pedis::handleCmdSet(int fd, std::string& key,std::string& val)
-{
+void Pedis::handleCmdSet(int client_fd, std::string& key,std::string& val) {
+    int record_total = 4+2+key.size()+4+val.size();
+    int record_size;
+    if (record_total%4096>0)
+    {
+        record_size = (record_total/4096+1)*4096;
+    } else
+    {
+        record_size = record_total;
+    }
 
+    char *buf = new char[record_size];
+    short key_size = key.size();
+    int val_size = val.size();
+    memcpy(buf, "aa55", 4);
+    memcpy(buf + 4, &key_size, 4);
+    memcpy(buf + 4 + 2, key.c_str(), key_size);
+    memcpy(buf + 4 + 2 + key_size, &val_size, 4);
+    memcpy(buf + 4 + 2 + key_size + 4, val.c_str(),val.size());
+
+    this->db_file->seekp(this->db_size, std::ios::beg);
+    this->db_file->write(buf, record_size);
+
+    this->records[key]=RecordMeta(this->db_size,record_size);
+    this->db_size += record_size;
+    this->sendOkStat(client_fd);
+    delete buf;
+}
+
+// TODO
+// 实现流式返回
+// direct IO
+// CRC check
+void Pedis::handleCmdGet(int client_fd, std::string &key)
+{
+    if (this->records.end()!=this->records.find(key))
+    {
+        RecordMeta recMeta = this->records[key];
+
+        char* buf = new char[recMeta.rec_size];
+        this->db_file->seekg(recMeta.rec_offset,std::ios::beg);
+        this->db_file->read(buf,recMeta.rec_size);
+
+        if (strncmp(buf,"aa55",4) !=0)
+        {
+            ::send(client_fd,"record magic err",16,0);
+            return;
+        }
+
+        short record_key_size = *((short*)&buf[4]);
+        int record_val_size = *((int*)&buf[4+2+record_key_size]);
+        this->sendCharStar(client_fd,buf+4+2+record_key_size+4,record_val_size);
+
+        delete buf;
+        return;
+    }
+    ::send(client_fd,"$-1\r\n",5,0);
 }
 
 void* worker(void* args)
@@ -381,12 +511,7 @@ void* worker(void* args)
         {
             if (cmd[0]=="get")
             {
-                if (pedis->_data.end()!=pedis->_data.find(cmd[1]))
-                {
-                    pedis->sendString(client_fd,pedis->_data[cmd[1]]);
-                } else {
-                    send(client_fd,"$-1\r\n",5,0);
-                }
+                pedis->handleCmdGet(client_fd,cmd[1]);
             } else {
                 pedis->sendUnSupportStat(client_fd);
             }
