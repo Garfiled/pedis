@@ -103,6 +103,9 @@ int parseSubStr(char* cmd,int start,int end);
 int parseCmdVal(char* cmd_buf,int* start_p,int cmd_length,std::string& cmd_p);
 int parseCmd(char* cmd_buf,int* start_p,int cmd_length,std::vector<std::string>* cmd);
 
+const char* pedis_db_header_magic = "Pedis";
+const char* pedis_record_header_magic = "aa55";
+
 int main(int argc, char const *argv[])
 {
     int socket_fd,epoll_fd;
@@ -235,6 +238,8 @@ void processQuery(Pedis* pedis,Client* client)
             client->queryStart = start;
 
             // 将命令发送到任务队列
+            // TODO
+            // 根据业务场景的不同，按命令保序、key、读写等方式决定命令到worker线程的路由方式
             pedis->q.push(CmdInfo(client->fd,cmd));
 
             if (start>=client->queryLen) {
@@ -371,7 +376,7 @@ int Pedis::init(std::string& path)
     this->db_file->seekg(0,std::ios::beg);
     char buf[4096];
     this->db_file->read(buf,sizeof(buf));
-    if (strncmp(buf,"Pedis",5)!=0)
+    if (strncmp(buf,pedis_db_header_magic,5)!=0)
     {
         std::cout << "file Pedis header err" << std::endl;
         return -1;
@@ -387,7 +392,7 @@ int Pedis::init(std::string& path)
         this->db_file->seekg(start,std::ios::beg);
         this->db_file->read(buf,sizeof(buf));
         // check magic number
-        if (strncmp(buf,"aa55",4) !=0)
+        if (strncmp(buf,pedis_record_header_magic,4) !=0)
         {
             std::cout << "file record magic err "<< start << std::endl;
             return -1;
@@ -468,7 +473,7 @@ void Pedis::handleCmdGet(int client_fd, std::string &key)
         this->db_file->seekg(recMeta.rec_offset,std::ios::beg);
         this->db_file->read(buf,recMeta.rec_size);
 
-        if (strncmp(buf,"aa55",4) !=0)
+        if (strncmp(buf,pedis_record_header_magic,4) !=0)
         {
             ::send(client_fd,"record magic err",16,0);
             return;
